@@ -2,8 +2,6 @@
 pragma solidity 0.8.9;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "./interface/IDistributor.sol";
-import "./interface/IGovernance.sol";
 import "./interface/IERC20Meta.sol";
 import "./interface/IWrapped.sol";
 import "./library/LibTrade.sol";
@@ -18,7 +16,7 @@ contract OscilloExchange is Ownable {
     bytes32 private constant _DOMAIN_VERSION = 0x0984d5efd47d99151ae1be065a709e56c602102f24c1abc4008eb3f815a8d217;
     bytes32 private constant _DOMAIN_NAME = 0xd8847acffb1e80c967781c9cefc950c79c285c67014ab8ca7bfb053adcb94e20;
 
-    uint private constant GAS_EXPECTATION_BUFFERED = 270000;
+    uint private constant GAS_EXPECTATION_BUFFERED = 280000;
     uint private constant RESERVE_MAX = 2500;
     uint private constant RESERVE_DENOM = 1000000;
     uint private constant PRICE_DENOM = 1000000;
@@ -27,8 +25,6 @@ contract OscilloExchange is Ownable {
     mapping(uint => uint) private _fills;
     mapping(address => bool) private _executors;
 
-    IGovernance public governance;
-    IDistributor public distributor;
     IWrapped public immutable nativeToken;
 
     event Executed(uint indexed matchId, uint[3] askTransfers, uint[3] bidTransfers);
@@ -41,9 +37,8 @@ contract OscilloExchange is Ownable {
 
     receive() external payable {}
 
-    constructor(address _governance, address _nativeToken) {
+    constructor(address _nativeToken) {
         _domainSeparator = keccak256(abi.encode(_DOMAIN_TYPEHASH, _DOMAIN_NAME, _DOMAIN_VERSION, block.chainid, address(this)));
-        governance = IGovernance(_governance);
         nativeToken = IWrapped(_nativeToken);
     }
 
@@ -97,6 +92,9 @@ contract OscilloExchange is Ownable {
             if (IERC20Meta(e.base).available(e.ask.account, address(this)) < askTransfers[0]) accepts[i].code = accepts[i].code | (1 << LibTrade.CodeIdxAskBalance);
             if (IERC20Meta(e.quote).available(e.bid.account, address(this)) < bidTransfers[0]) accepts[i].code = accepts[i].code | (1 << LibTrade.CodeIdxBidBalance);
 
+            if (e.ask.deadline < block.timestamp) accepts[i].code = accepts[i].code | (1 << LibTrade.CodeIdxAskDeadline);
+            if (e.bid.deadline < block.timestamp) accepts[i].code = accepts[i].code | (1 << LibTrade.CodeIdxBidDeadline);
+
             accepts[i].askTransfers = [askTransfers[0], askTransfers[1], askTx];
             accepts[i].bidTransfers = [bidTransfers[0], bidTransfers[1], bidTx];
         }
@@ -110,6 +108,13 @@ contract OscilloExchange is Ownable {
         for (uint i = 0; i < chunk.length; i++) {
             uint code;
             LibTrade.MatchExecution memory e = chunk[i];
+
+            if (e.ask.deadline < block.timestamp) code = code | (1 << LibTrade.CodeIdxAskDeadline);
+            if (e.bid.deadline < block.timestamp) code = code | (1 << LibTrade.CodeIdxBidDeadline);
+            if (code != 0) {
+                emit Cancelled(e.mid, code);
+                continue;
+            }
 
             uint amountQ = e.amount * e.price * (10 ** IERC20Meta(e.quote).decimals()) / PRICE_DENOM / (10 ** IERC20Meta(e.base).decimals());
             if (IERC20Meta(e.base).available(e.ask.account, address(this)) < e.amount) code = code | (1 << LibTrade.CodeIdxAskBalance);
@@ -139,6 +144,7 @@ contract OscilloExchange is Ownable {
             (uint askTx, uint bidTx) = _txCosts(e, askFilled, bidFilled, tx.gasprice, gasUsed);
             if (askReserve + askTx > amountQ) code = code | (1 << LibTrade.CodeIdxAskCost);
             if (bidReserve + bidTx > e.amount) code = code | (1 << LibTrade.CodeIdxBidCost);
+
             if (code != 0) {
                 emit Cancelled(e.mid, code);
                 continue;
@@ -172,32 +178,12 @@ contract OscilloExchange is Ownable {
         _executors[target] = on;
     }
 
-    function setDistributor(address newDistributor) external onlyOwner {
-        require(newDistributor != address(0) && newDistributor != address(distributor), "!distributor");
-        if (address(distributor) != address(0)) {
-            IERC20Meta(distributor.rewardToken()).safeApprove(address(distributor), 0);
-        }
-
-        distributor = IDistributor(newDistributor);
-        IERC20Meta rewardToken = IERC20Meta(distributor.rewardToken());
-        rewardToken.safeApprove(address(distributor), 0);
-        rewardToken.safeApprove(address(distributor), type(uint).max);
-    }
-
-    function distribute(uint checkpoint, uint accVolume, uint rewardAmount) external onlyOwner {
-        require(address(distributor) != address(0), "!distributor");
-        governance.notifyAccVolumeUpdated(checkpoint, accVolume);
-        distributor.notifyRewardDistributed(rewardAmount);
-    }
-
-    function sweep(address[] calldata tokens) external onlyOwner {
-        address rewardToken = distributor.rewardToken();
+    function sweep(address[] calldata tokens, address target) external onlyOwner {
+        require(target != address(0), "!target");
         for (uint i = 0; i < tokens.length; i++) {
-            if (tokens[i] == rewardToken) continue;
-
             IERC20Meta token = IERC20Meta(tokens[i]);
             uint leftover = token.balanceOf(address(this));
-            if (leftover > 0) token.safeTransfer(owner(), leftover);
+            if (leftover > 0) token.safeTransfer(target, leftover);
         }
     }
 
